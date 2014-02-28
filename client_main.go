@@ -1,243 +1,340 @@
 package main
 
+/*
+#include <inttypes.h>
+#include "client_main.c"
+extern int sendCtrlMsg(uint16_t msgType, uint16_t dataLen, char *data, char *resp);
+extern int registerClient();
+extern int initReciever();
+extern char * getNameBuffer();
+extern char * readChatMsg(char *name);
+extern void shutdownClient();
+extern int initConnections(char *hostName, u_int16_t tcp, u_int16_t udp, char *name);
+*/
+import "C"
+import "flag"
 import "fmt"
+import "bufio"
+import "os"
 import "time"
-import "unsafe"
 import "strings"
-import "github.com/mattn/go-gtk/gtk"
-import "github.com/mattn/go-gtk/gdk"
-import "github.com/mattn/go-gtk/glib"
+import "net/http"
+import "io/ioutil"
 
-// Utility method: Returns true if message is a control message
-func isCtrlMessage(message string) bool {
-	return strings.HasPrefix(message, "!")
+// optarg flags
+var host = flag.String("h", "localhost", "")
+var udpPort = flag.Int("u", 0, "")
+var tcpPort = flag.Int("t", 0, "")
+var nick = flag.String("n", "", "")
+var LOCSERV = flag.Bool("D", false, "")
+var TERMINAL = flag.Bool("noX", false, "")
+
+// Current Room
+var currRoom = C.CString("")
+
+const CLIENT_MSG = 0 // Regular Client mesg
+const SWITCH_MSG = 1 // Switch to room mesg
+const MEMBER_MSG = 2 // mesg contains members in room
+const ROOMSL_MSG = 3 // mesg contains available rooms
+const USQUIT_MSG = 4 // user has quit, no mesg
+const CREATE_MSG = 5 // new room added, mesg on failure
+const RESTAR_MSG = 6 // restart the server connection
+const KEEPAL_MSG = 7 // send a generic message type
+const ERRORI_MSG = 8 // bad input 
+
+// format for gui to display
+type Message struct {
+	name    string
+	mesg    string
+	control int
 }
 
-// Utility method: Returns true of message is terminated by return
-func isEndOfMessage(message string) bool {
-	return strings.HasSuffix(message, "\n")
-}
-
-func toUtf8(iso8859_1_buf []byte) string {
-	buf := make([]rune, len(iso8859_1_buf))
-	for i, b := range iso8859_1_buf {
-		buf[i] = rune(b)
+/*
+ * Read from standardin and write output to either
+ * c chan or d chan based on the prefix "!"
+ */
+func readStdIn(c chan string, d chan string) {
+	stdIn := bufio.NewReader(os.Stdin)
+	data, _ := stdIn.ReadString('\n')
+	for data != "" {
+		if strings.HasPrefix(data, "!") {
+			d <- strings.TrimRight(data, "\n") + " "
+		} else if strings.HasPrefix(data, "Server:") {
+			// drop it
+		} else {
+			c <- strings.TrimRight(data, "\n")
+		}
+		data, _ = stdIn.ReadString('\n')
 	}
-	return string(buf)
 }
 
-// handles creation and update of GUI components while sending
-// data back and forth between the c handlers
-func LaunchGUI(servData chan Message, cData chan string, ctrlData chan string) {
+/*
+ * read from c and chat with server
+ */
+func readChat(c chan string) {
+	data := <-c
+	for data != "" {
+		chat(data)
+		data = <-c
+	}
+}
 
-	gtk.Init(nil)
-	window := gtk.NewWindow(gtk.WINDOW_TOPLEVEL)
-	window.ModifyBG(window.GetState(), gdk.NewColor("#99ccff"))
-	window.SetPosition(gtk.WIN_POS_CENTER)
-	window.SetTitle("Le Distributed Chat Client ~")
-	window.Connect("destroy", func(ctx *glib.CallbackContext) {
-		// add any extra clean up code
-		ctrlData <- "!q"
-		gtk.MainQuit()
-	})
+/*
+ * read from server and write to c 
+ */
+func readServer(c chan Message) {
+	for {
 
-	vbox := gtk.NewVBox(false, 1)
-	menubar := gtk.NewMenuBar()
-	vbox.PackStart(menubar, false, false, 0)
+		cname := C.getNameBuffer()
+		data := C.GoString(C.readChatMsg(cname))
+		name := C.GoString(cname)
+		c <- Message{name, "\033[1m" + data + "\033[0m", CLIENT_MSG}
 
-	vpaned := gtk.NewVPaned()
-	vbox.Add(vpaned)
+	}
+}
 
-	// shows chat messages and server responses.
-	msgFrame := gtk.NewFrame("")
-	msgFrameBox := gtk.NewVBox(false, 1)
-	msgFrame.Add(msgFrameBox)
-
-	msgFrameBox.SetBorderWidth(5)
-	// the user types in messages here.
-	ctrlFrame := gtk.NewFrame(*nick)
-	ctrlFrameBox := gtk.NewVBox(false, 1)
-	ctrlFrame.Add(ctrlFrameBox)
-
-	vpaned.Pack1(msgFrame, false, false)
-	vpaned.Pack2(ctrlFrame, false, false)
-
-	label := gtk.NewLabel("Distributed Chat Client")
-	label.ModifyFontEasy("bold calibri 16 white")
-	label.SetPadding(20, 20)
-	msgFrameBox.PackStart(label, false, true, 0)
-
-	sCtrlWin := gtk.NewScrolledWindow(nil, nil)
-	sCtrlWin.SetPolicy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
-	sCtrlWin.SetShadowType(gtk.SHADOW_IN)
-	ctrlTextView := gtk.NewTextView()
-
-	ctrlTextViewBuffer := ctrlTextView.GetBuffer()
-	ctrlTextView.ModifyFontEasy("bold calibri 16")
-	sCtrlWin.Add(ctrlTextView)
-
-	ctrlFrameBox.SetBorderWidth(5)
-	ctrlFrameBox.Add(sCtrlWin)
-
-	event := make(chan interface{})
-
-	ctrlTextView.Connect("key-release-event", func(ctx *glib.CallbackContext) {
-		arg := ctx.Args(0)
-		event <- *(**gdk.EventKey)(unsafe.Pointer(&arg))
-	})
-
-	// go routine to handle cleanup for control text view
-	go func() {
-		var start gtk.TextIter
-		var end gtk.TextIter
-		for {
-			e := <-event
-			switch ev := e.(type) {
-			case *gdk.EventKey:
-				// enter key
-				if 65293 == ev.Keyval {
-					fmt.Println("user hit Enter beginning to parse input.")
-					// if the user hits the return key then the message is sent 
-					// over the channel and the ctrlTextView is cleared.
-					ctrlTextViewBuffer.GetStartIter(&start)
-					ctrlTextViewBuffer.GetEndIter(&end)
-					userInput := ctrlTextViewBuffer.GetText(&start, &end, true)
-
-					ctrlTextViewBuffer.SetText("")
-
-					fmt.Println("User entered ", userInput)
-					userInput = strings.TrimRight(userInput, "\n")
-					userInput = strings.TrimLeft(userInput, "\n")
-					userInput = strings.TrimRight(userInput, " ")
-					userInput = strings.TrimLeft(userInput, " ")
-
-					if isCtrlMessage(userInput) {
-						fmt.Println("... is a control message, trimming and passing over ctrl channel.")
-						ctrlData <- userInput
-
-					} else {
-						// if the input is a chat message send it over the client data channel.
-						fmt.Println("... is a chat message, trimming and passing over user channel.")
-						cData <- userInput
-					}
-				}
-				break
-			}
+/*
+ * read from c, send to server and write to d
+ */
+func readControl(c chan string, d chan Message) {
+	data := <-c
+	ctrl_type := 0
+	for data != "" {
+		output := control(data, &ctrl_type)
+		if output != "" {
+			d <- Message{"Server", "\033[1m" + output + "\033[0m", ctrl_type}
 		}
-	}()
+		data = <-c
+	}
+}
 
-	// scrollable window for displaying chat for a given 
-	// room or for control responses from the server.
-	sMsgWin := gtk.NewScrolledWindow(nil, nil)
-	sMsgWin.SetPolicy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
-	sMsgWin.SetShadowType(gtk.SHADOW_IN)
-	msgTextView := gtk.NewTextView()
+/*
+ * read from c write to stdout
+ */
+func writeStdOut(c chan Message) {
+	data := <-c
+	for {
+		fmt.Printf("%s: %s\n", data.name, data.mesg)
+		data = <-c
+	}
+}
 
-	// The user cannot edit this window
-	msgTextView.SetEditable(false)
-	msgTextViewBuffer := msgTextView.GetBuffer()
+/*
+ * Location Server
+ */
+func getLocationServer() {
+	resp, err := http.Get("http://www.cdf.toronto.edu/~csc469h/fall/chatserver.txt")
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Sscanf(string(data), "%s %d %d", host, tcpPort, udpPort)
+}
 
-	sMsgWin.Add(msgTextView)
-	msgFrameBox.Add(sMsgWin)
+/*
+ * Initilize the underlying C structures
+ * All ports are opened here and the reciever is prepared
+ * Server registration is also done here
+ */
+func initClient() int {
 
-	msgTextViewBuffer.Connect("changed", func() {
-		fmt.Println("changed")
-	})
+	port := C.initReciever()
 
-	// status bar
-	statusbar := gtk.NewStatusbar()
-	context_id := statusbar.GetContextId("go-gtk")
-	statusbar.Push(context_id, "status messages go here")
-	ctrlFrameBox.PackStart(statusbar, false, false, 0)
+	if port == -1 {
+		fmt.Println("error during initialization of reciever")
+		return -1
+	}
 
-	// start a go routine to listen for messages coming in from
-	// the server channel, then display these messages on the message window
-	go func() {
-		for {
-			// Message struct 
-			s := <-servData
-			t := time.Now().Format(time.RubyDate)
-			fmt.Print("received data from servData ", s)
-			t = t[11:19]
-			switch s.control {
-			case CLIENT_MSG:
-				var start gtk.TextIter
-				// Regular Client mesg
-				// display in msgTextViewl
-				msgTextViewBuffer.GetStartIter(&start)
-				mesg := s.mesg
-				mesg = mesg[4 : len(mesg)-4]
+	err := C.initConnections(C.CString(*host),
+		C.uint16_t(*tcpPort),
+		C.uint16_t(*udpPort),
+		C.CString(*nick))
 
-				mesg = "[" + s.name + "] " + t + " : " + mesg
-				msgTextViewBuffer.Insert(&start, mesg+"\n")
+	if err == -1 {
+		// print message to GUI and exit
+		fmt.Println("error during initialization.")
+		return -1
+	}
 
-				statusbar.Pop(context_id)
-				statusbar.Push(context_id, "Received message from "+s.name)
+	err = C.registerClient()
 
-			case SWITCH_MSG:
+	if err == -1 {
+		fmt.Println("error during registration.")
+		return -1
+	}
 
-				mesg := s.mesg
-				mesg = mesg[4 : len(mesg)-4]
+	fmt.Println("Success!")
+	return 0
+}
 
-				if mesg != "Already in this room!" {
-					gdk.ThreadsEnter()
-					label.SetLabel(mesg)
-					gdk.ThreadsLeave()
-					statusbar.Push(context_id, "Received message from server")
-				}
+/*
+ * send a string to the server
+ */
+func chat(data string) {
+	dataLen := C.uint16_t(len(data))
+	cdata := C.CString(data)
+	err := C.sendChatMsg(dataLen, cdata)
+	if err == -1 {
+		fmt.Println("error during chat send.")
+	}
+}
 
-			case MEMBER_MSG:
-				var start gtk.TextIter
-				mesg := s.mesg
-				mesg = mesg[4 : len(mesg)-4]
-				// mesg contains members in room
-				// print the members in the room in msgTextView
-				msgTextViewBuffer.GetStartIter(&start)
-				msgTextViewBuffer.Insert(&start, "["+s.name+"]: "+mesg+"\n")
-				statusbar.Pop(context_id)
-				statusbar.Push(context_id, "Received message from server")
+/*
+ * send a control string to the server, return the reply
+ */
+func control(data string, ctrl_type *int) string {
 
-			case ROOMSL_MSG:
-				var start gtk.TextIter
-				mesg := s.mesg
-				mesg = mesg[4 : len(mesg)-4]
-				// mesg contains available rooms
-				// print available room in msgTextView
-				msgTextViewBuffer.GetStartIter(&start)
-				msgTextViewBuffer.Insert(&start, "["+s.name+"]: "+mesg+"\n")
-				statusbar.Pop(context_id)
-				statusbar.Push(context_id, "Received message from server")
+	ctrl := strings.Split(data, " ")[0]
 
-			case CREATE_MSG:
-				var start gtk.TextIter
-				mesg := s.mesg
-				mesg = mesg[4 : len(mesg)-4]
-				// create a new room
-				// display that a new room is created in msgTextView
-				msgTextViewBuffer.GetStartIter(&start)
-				msgTextViewBuffer.Insert(&start, "["+s.name+"]: "+mesg+"\n")
-				statusbar.Pop(context_id)
-				statusbar.Push(context_id, "Received message from server")
+	dataLen := C.uint16_t(len(""))
+	cdata := C.CString("")
+	output := C.CString("")
 
-			case USQUIT_MSG:
-				// user has quit, no mesg
-				// kill GUI
-				gtk.MainQuit()
-			case KEEPAL_MSG:
-				// invalid name
-				statusbar.Pop(context_id)
-				statusbar.Push(context_id, "ERROR: name invalid. Not connected to server.")
-			case ERRORI_MSG:
-				// write to status field: couldn't write
-				statusbar.Pop(context_id)
-				statusbar.Push(context_id, "Invalid operation performed!")
-			}
+	data = strings.TrimLeft(data, ctrl)
+	data = strings.Trim(data, " ")
+
+	// Switch between all ctrl types, two of them are added for fault tolerance
+	switch ctrl {
+	case "!r":
+		*ctrl_type = ROOMSL_MSG
+		output = C.requestInfo(C.ROOM_LIST_REQUEST, cdata, dataLen, C.ROOM_LIST_SUCC)
+	case "!c":
+		*ctrl_type = CREATE_MSG
+		dataLen = C.uint16_t(len(data))
+		cdata = C.CString(data)
+		output = C.requestInfo(C.CREATE_ROOM_REQUEST, cdata, dataLen, C.CREATE_ROOM_SUCC)
+		if C.GoString(output) == "" {
+			output = cdata
 		}
-	}()
+	case "!s":
+		*ctrl_type = SWITCH_MSG
+		dataLen = C.uint16_t(len(data))
+		cdata = C.CString(data)
+		output = C.requestInfo(C.SWITCH_ROOM_REQUEST, cdata, dataLen, C.SWITCH_ROOM_SUCC)
+		if C.GoString(output) == "" {
+			output = cdata
+			currRoom = cdata
+		}
+	case "!m":
+		*ctrl_type = MEMBER_MSG
+		dataLen = C.uint16_t(len(data))
+		cdata = C.CString(data)
+		output = C.requestInfo(C.MEMBER_LIST_REQUEST, cdata, dataLen, C.MEMBER_LIST_SUCC)
+	case "!q":
+		*ctrl_type = USQUIT_MSG
+		C.requestInfo(C.QUIT_REQUEST, cdata, dataLen, C.QUIT_REQUEST)
+		fmt.Println("You have quit, goodbye")
+		C.shutdownClient()
+		os.Exit(0)
+	case "!k":
+		*ctrl_type = KEEPAL_MSG
+		output = C.requestInfo(C.MEMBER_KEEP_ALIVE, cdata, dataLen, C.MEMBER_KEEP_ALIVE)
+	case "!x":
+		*ctrl_type = RESTAR_MSG
+		fmt.Println("Did you just ask for a restart? CAUSE THATS WHAT YOURE GETTING")
+		C.shutdownClient()
+		redoInit()
+	default:
+		*ctrl_type = ERRORI_MSG
+		output = C.CString("operation could not be completed")
+	}
 
-	window.Add(vbox)
-	window.SetSizeRequest(600, 600)
-	window.ShowAll()
+	// Read the output from our ctrl if null, then we dont need 
+	// to display anything, if boo then the server died
+	// Return the message from the server
+	if output == nil {
+		// No output due to either bad ctrl or no output 
+		return ""
+	} else if C.GoString(output) == "boo" {
+		// jesus the server is dead
+		C.shutdownClient()
+		redoInit()
+		return ""
+	}
 
-	go gtk.Main()
+	return C.GoString(output)
+}
+
+/*
+ * Try to recconect twice, once immediatly, the other in a second with a different name
+ * Switch to room that you were last in
+ */
+func redoInit() {
+	if *LOCSERV {
+		getLocationServer()
+	}
+	err := initClient()
+	time.Sleep(time.Second)
+	if err == -1 {
+		*nick = "_" + *nick
+		fmt.Printf("retrying with name: %s\n", *nick)
+		C.shutdownClient()
+		err = initClient()
+	} else {
+		// auto connect to the room
+		C.requestInfo(C.SWITCH_ROOM_REQUEST, currRoom, C.uint16_t(10), C.SWITCH_ROOM_SUCC)
+	}
+
+	if err == -1 {
+		fmt.Println("Failed to restart connection, Goodbye")
+		C.shutdownClient()
+		os.Exit(0)
+
+	} else {
+		// auto connect to the room
+		C.requestInfo(C.SWITCH_ROOM_REQUEST, currRoom, C.uint16_t(10), C.SWITCH_ROOM_SUCC)
+
+	}
+
+}
+
+/*
+ * Checks to see if the server is still around periodically 
+ */
+func heartBeatChecker(c chan string) {
+	for {
+		time.Sleep(4 * 1e9)
+		c <- "!k"
+	}
+}
+
+/*
+ * Main run method, spawn all go threads after the initial init command is done
+ * Sleep indefinetly after 
+ */
+func main() {
+
+	// TODO: enforce lenth of nick. 
+	flag.Parse()
+	if *LOCSERV {
+		getLocationServer()
+		fmt.Printf("Using Location Server host: %s, tcp: %d, udp: %d\n", *host, *tcpPort, *udpPort)
+	}
+
+	err := initClient()
+	if err == -1 {
+		return
+	}
+
+	serverData := make(chan Message)
+	clientData := make(chan string)
+	ctrlData := make(chan string)
+
+	if *TERMINAL {
+		go readStdIn(clientData, ctrlData)
+		go writeStdOut(serverData)
+	} else {
+		go LaunchGUI(serverData, clientData, ctrlData)
+	}
+
+	go readChat(clientData)
+	go readControl(ctrlData, serverData)
+	go readServer(serverData)
+	go heartBeatChecker(ctrlData)
+	go heartBeatChecker(ctrlData)
+
+	for {
+		time.Sleep(4 * 1e9)
+	}
+
 }
