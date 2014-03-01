@@ -32,7 +32,7 @@ int recFd;
 
 /* Generic Chat Message sender
  * Builds a chat message with the given msg data
- * Sends it out on the known tcp port
+ * Sends it out on the known udp port
  */ 
 int sendChatMsg(uint16_t dataLen, char *data) {
     char buffer[MAX_MSG_LEN];
