@@ -331,7 +331,6 @@ func main() {
 	go readControl(ctrlData, serverData)
 	go readServer(serverData)
 	go heartBeatChecker(ctrlData)
-	go heartBeatChecker(ctrlData)
 
 	for {
 		time.Sleep(4 * 1e9)
